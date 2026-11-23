@@ -514,3 +514,64 @@ PR #154 收到 CHANGES_REQUESTED，程式碼沒有意見，只要求移除 `expe
 💡 **計畫寫完要回頭對程式碼。** 貼 issue 前我對了標頭與便條的部分，重連這一段只對了一半。教學時逐列對程式碼才發現，這就是「解釋給別人聽」會逼你驗證假設的價值。
 
 💡 **暫態放記憶體，長期資料放資料庫。** 這份計畫沒加任何資料庫欄位，因為「誰正在錄」人一離線就不成立，存進資料庫反而要處理殘留的髒資料。判斷一筆資料該放哪，先問「程式重啟後它還應該存在嗎」——逐字稿內容要（D1），轉錄中名單不要（DO 便條）。
+
+### 4. 教學：issue 留言第 3 點「DO 測試 vs 純函式測試」在問什麼（2026-11-23 晚）
+
+> 📚 **明天（11/24）要學的段落。** 讀完試著用自己的話回答：為什麼 `capturersFromMetas()` 要抽出來？DO 測試多驗到哪三件事？代價是什麼？
+
+留言第 3 點問維護者「新增 `meeting-room.test.ts` 直接建構 DO 加假 WebSocket 來測，可以接受嗎？還是維持純函式層級就好？」白話是：**我打算用一種成本較高、但能驗到更多東西的測法，你們願意為它養一套替身嗎？**
+
+**兩種測法差在「測的對象有多大」**
+
+_純函式層級_：測的對象是一個獨立函式。看 `src/tests/transcription-versions.test.ts`：
+
+```ts
+expect(formatVersionId(epoch)).toBe('20260803T091500123Z')
+expect(isValidVersionId('../../secret')).toBe(false)
+```
+
+結構是「餵一個輸入，斷言一個輸出」。`formatVersionId` 不讀資料庫、不碰網路、不看時間，同樣輸入永遠同樣輸出，所以叫**純函式**。測它不需要任何準備。步驟 2 的 `capturersFromMetas()` 刻意設計成這種函式，測試三行就釘住去重與過濾：
+
+```ts
+const metas = [
+  { userId: 'a', name: '小明', capturing: true },
+  { userId: 'a', name: '小明', capturing: true }, // 同一人第二個分頁
+  { userId: 'b', name: '阿華', capturing: false },
+]
+expect(capturersFromMetas(metas)).toEqual([{ userId: 'a', name: '小明' }])
+```
+
+_直接建構 DO_：測的對象是整個 `MeetingRoom` 類別。DO 設計上要活在 Cloudflare 環境，依賴測試機器上沒有的東西，每一樣都要做替身：
+
+| DO 依賴什麼               | 正式環境誰提供      | 測試時怎麼辦                                                                                          |
+| ------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------- |
+| `cloudflare:workers` 模組 | Cloudflare 執行環境 | `vite.config.ts` 在 VITEST 模式把它換成 `src/shims/cloudflare-workers.ts`                             |
+| `ctx.getWebSockets()`     | DurableObjectState  | 自己做一個假 `ctx`，回傳一個陣列                                                                      |
+| 真的 WebSocket            | 瀏覽器連進來        | `FakeWebSocket` 類別：`send()` 不真的送，只把訊息存進陣列；`deserializeAttachment()` 回我們塞的假便條 |
+| D1                        | Cloudflare D1       | `FakeD1`，用 `Map` 假裝資料表                                                                         |
+
+這套在 11/19 的 commit `149f2b1` 寫過一次（`meeting-room.test.ts` 148 行 + `helpers/fake-d1.ts`），11/20 縮減 PR 時整個刪掉。骨架簡化後：
+
+```ts
+const alice = new FakeWebSocket({ isAuthenticated: true, userId: 'uid-alice', date })
+const meeting = new MeetingRoom({ getWebSockets: () => [alice, bob] }, { DB: fakeDb })
+await meeting.webSocketMessage(alice, JSON.stringify({ type: 'capture_status', capturing: true }))
+expect(bob.sent.at(-1)).toEqual({ type: 'capture_list', capturers: [...] })
+```
+
+做的事是「假裝 Alice 送了一則訊息，檢查 Bob 的假 WebSocket 有沒有收到正確的廣播」。測的不再是一個函式的輸入輸出，而是 DO 收到訊息後**一連串動作**的結果：改便條 → 重算名單 → 廣播所有人。
+
+**為什麼要問維護者**：不是哪個對，是值不值得。
+
+- _純函式測不到的洞_：`capturersFromMetas()` 對了，不代表 DO 在正確時機呼叫它。「斷線時排除正在斷的連線」「舊版 `sync_recording` 也要更新便條」「未登入送 `capture_status` 要被拒」三件事全在 DO 的 `switch` 與回呼裡，純函式碰不到。11/19 就是靠 DO 測試模擬第三個旁觀者，才抓到「修正指令廣播給所有人會讓別人誤刪自己條目」的 bug。
+- _DO 測試的代價_：要養 `FakeWebSocket`、假 `ctx`、`FakeD1`、shim。每個替身都是「我猜 Cloudflare 會這樣行為」的模型，Cloudflare 改 API 替身不會跟著變。Link1515 才剛以維護負擔為由要求移除 experiments/，bestian 一再強調維持簡潔，多一套測試基礎設施可能被視為負擔。
+
+所以第 3 點是在問：**願意為了多驗到 DO 層的行為，多養這一套替身嗎？** 答「只要純函式」→ 把去重排序測好，DO 層靠本機開兩個瀏覽器手動驗；答「可以」→ 把 `149f2b1` 的骨架撿回來改。
+
+**延伸觀念：測試金字塔**
+
+- **底層**：純函式單元測試。多、快、便宜、穩定。本 repo 絕大多數測試在這層。
+- **中層**：模組測試，用替身換掉外部依賴。DO 測試在這層。能驗流程，但要養替身。
+- **頂層**：端對端，真瀏覽器真服務。最像真實使用，但慢、貴、容易因環境紅燈。AGENTS.md 說「尚無帶 session 的端點層級整合測試」就是這層目前是空的。
+
+💡 **能推到底層的邏輯盡量抽成純函式推下去，中層只留真正需要驗流程的部分。** 步驟 2 把排序去重抽成 `capturersFromMetas()` 就是在做這件事；剩下真的留在 DO 裡的，才需要問值不值得用中層測試蓋。
