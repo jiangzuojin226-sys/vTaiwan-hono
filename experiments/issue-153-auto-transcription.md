@@ -798,3 +798,87 @@ DO 現在的 `webSocketClose`（132）只回 `ws.close(code, reason)`。計畫�
 
 1. 回答第 4 節的三個自測問題。
 2. `git fetch upstream`，從 `upstream/main` 開 `feat/153-capture-list`，依第 4、5 節的契約實作，測試照第 9 節 12 條。
+
+## 2026-11-25 晚：步驟 2 實作完成（分支 `feat/153-capture-list`，尚未開 PR）
+
+### 1. 進度
+
+從 `upstream/main`（f9ff5de）開分支，五筆 checkpoint commit 皆已推到 fork `origin`，upstream 未碰：
+
+| 步 | commit | 內容 |
+| --- | --- | --- |
+| 1 | 0826483 | `src/lib/capture-list.ts` 純函式 + 10 測試 |
+| 2 | 303e368 | Worker `buildForwardHeaders()` 無條件覆寫身分標頭 + 5 測試 |
+| 3、4 | d60fd0b | DO 名單聚合 + `helpers/fake-ws.ts` + 23 個 DO 測試 |
+| 5、7 | d23b8b6 | 前端名單顯示、`announceCapture`、斷線顯示、刪計時器、i18n 三檔 |
+| 6 | 50b0ec2 | 前端 19 個測試（送出時機、onopen 順序、斷線顯示） |
+
+驗收（第 8 步）：`vp check --no-fmt --no-lint`、`vp run build`、`vp run lemma:gen`、`vp check`、`vp test`（32 檔 348 個）全綠。本機沒裝 Dafny，`lemma:check` 交給 CI。
+
+### 2. 實作時學到的三件事
+
+- **Node 建不出 101 的 Response**，所以 DO 的 WebSocket 升級路徑無法在測試中跑。解法：把「組 init 訊息」抽成公開方法 `initMessage(date)`，升級路徑呼叫它、測試直接呼叫它。這又是「純核心抽取」的變形。
+- **變異測試**（mutation testing）：故意把一行關鍵程式拿掉，看測試會不會紅。拿掉 DO 的 `serializeAttachment()` 紅 8 個、拿掉前端 `announceCapture` 的去重守衛紅 5 個。紅了才證明測試真的在守那行；沒紅就是假綠。
+- **`disconnectWs()` 會先拔掉 `onclose`**，所以切歷史日期時寫在 `onclose` 的清理不會跑。清名單要放 `disconnectWs()` 本身。測試「主動斷線 onclose 被拔掉仍會清名單」釘住這點。
+
+### 3. 分隔符也要走翻譯
+
+名單名字之間的分隔符中日文用「、」、英文用「, 」，寫死在程式裡會違反「介面文字一律走翻譯」，所以多加了 `jitsi.capturingListSeparator`。計畫裡原本沒這個 key。
+
+### 4. 下一步
+
+1. 本機雙瀏覽器實測（需 `.dev.vars` 與兩個帳號），填進 PR 草稿的勾選清單。
+2. 以草稿開 PR 到 upstream（先給使用者看過）。
+
+### 5. PR 說明草稿
+
+## 標題
+
+feat: 顯示所有正在轉錄的參與者（#153 步驟 2）
+
+## 說明
+
+依 #153 的方案 B 與 bestian 在 [issue 留言](https://github.com/g0v/vTaiwan-hono/issues/153#issuecomment-7115440143) 補的狀態契約實作。把按鈕旁「{某人} 錄音中」的單格顯示，換成「正在轉錄：甲、乙」名單。不加 migration、不碰逐字稿寫入路徑、不碰授權模型。
+
+### 改動
+
+| 層 | 改動 |
+| --- | --- |
+| `src/lib/capture-list.ts` | 純函式 `capturersFromMetas()`：過濾 capturing、以 userId 去重、依名字排序；`encodeUserName` / `decodeUserName` 處理中文名稱進出 HTTP 標頭 |
+| Worker `meeting.ts` | 抽出 `buildForwardHeaders()`：`X-Authenticated` / `X-User-Id` / `X-User-Name` 一律依 session **無條件覆寫**，外部請求自帶的同名標頭不會穿透到 DO |
+| DO `meeting-room.ts` | 名牌（attachment）加 `name` / `capturing`；新增 `capture_status`（只收布林、走既有登入門口之後）與 `capture_list` 廣播；`init` 帶現有名單。每次改 `capturing` 都重新 `serializeAttachment()`，沒變不廣播。`webSocketClose` / `webSocketError` 先把名牌標為沒在錄再關閉；聚合只看 `readyState === OPEN`，排除 CLOSING 連線 |
+| 前端 `JitsiView.vue` | `announceCapture()`：錄音器**成功啟動後**才送 true，每 30 秒換段不重送；`stopAudioRecording` 與 `cleanupAudioRecording`（登出失去權限、錄音錯誤、離頁）送 false。`onopen` 丟掉佇列裡過期的 `capture_status`，最後依當下狀態補送一次。意外斷線清空名單並顯示「名單無法同步」；切歷史日期在 `disconnectWs()` 清空。顯示移到按鈕左側可換行，與待處理音檔數各自顯示，拿掉 `!isTranscripting` 條件。移除 `recordingDuration` 與每秒計時器 |
+| i18n | 三檔新增 `jitsi.capturingList` / `capturingListSeparator` / `captureUnavailable`，移除 `jitsi.recordingStatus` |
+
+### 相容橋（過渡用，日後移除）
+
+- 保留 `recording_speaker` 欄位與 `sync_recording` / `recording_synced` 訊息。DO 收到舊版 `sync_recording` 時照舊寫 D1 與廣播，另外**只更新送出該訊息那條連線**的 `capturing`（`recording_speaker` 非 null 即在錄），不拿全房間的 `recording_speaker` 反推名單；名字取自名牌，不採信訊息內容。
+- 新版名單只以 `init` / `capture_list` 為資料來源，不受 `recording_synced` 的單格狀態影響。
+- **限制**：這讓新版頁面能看到仍用舊協定的參與者，但不會修好舊版頁面自己的單人顯示；部署後尚未再送出狀態的舊版頁面，不保證立刻出現在新名單中（要等它下一次 30 秒換段送 `sync_recording`）。
+- **移除條件**：確認線上已無舊版頁面後（例如部署一週後），可移除前端 `syncRecordingStatus()`、DO 的 `sync_recording` 相容橋與 `recording_speaker` 的讀寫；`meeting_sessions.recording_speaker` 欄位可留著不用。
+
+### 測試
+
+自動測試（`vp test` 348 passed，新增 69 個）：
+
+- `capture-list.test.ts`（10）：去重、排序、未登入不列入、中文名稱編碼往返與損毀處理。
+- `meeting-auth.test.ts`（+5）：外部自帶身分標頭被覆寫、停權視為未授權、其他標頭保留。
+- `meeting-room.test.ts`（23）：直接建構 DO，搭配 `helpers/fake-ws.ts` 的假 WebSocket（attachment 兩端 `structuredClone`，close 後留在 `getWebSockets()` 且為 CLOSING）、假 ctx、假 D1。呼叫真正的 `webSocketMessage` / `webSocketClose` / `webSocketError` / `initMessage`，斷言其他連線收到的名單：同帳號兩分頁其一關閉／停止另一仍在、attachment 重新反序列化仍是最新狀態、CLOSING 連線不詐屍、未登入被拒、訊息內塞別人身分無效、新舊訊息交錯不互踢、`init` 與現場廣播一致。
+- `audio-recording.test.ts`（+7）與 `jitsi-capture-ws.test.ts`（12）：等待授權／拒絕權限／啟動失敗不送 true、跨三輪換段只送一次 true、登出與錄音錯誤送 false、`onopen` 沖出順序、意外斷線與主動斷線的名單顯示。
+- 變異測試（手動）：拿掉 DO 的 `serializeAttachment()` 會紅 8 個；拿掉前端 `announceCapture` 去重守衛會紅 5 個。
+
+這些單元測試驗的是應用邏輯，驗不到真實 Worker 的 WebSocket 升級、休眠與斷線行為。以下為本機雙瀏覽器實測：
+
+<!-- 實測後填：每項寫「✅ / ❌ + 觀察到什麼」 -->
+
+- [ ] 兩個瀏覽器登入不同帳號，各按紫色麥克風：兩邊名單一致（含自己）
+- [ ] 一邊停止：另一邊即時更新
+- [ ] 一邊的音檔送去轉錄期間（轉錄中提示出現）：名單仍可見
+- [ ] 同帳號開兩個分頁都錄，關掉其中一個：另一個分頁仍在名單；關第二個才消失
+- [ ] 錄音中拔網路／停掉 dev server：名單變灰顯示「名單無法同步」，本機按鈕倒數仍繼續
+- [ ] 切到歷史日期：名單消失、不顯示無法同步
+- [ ] 中文名稱正確顯示；三語切換文案正確
+- [ ] 手機寬度：多人名單換行、不蓋住按鈕
+- [ ] devtools console 無 hydration mismatch 警告
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
