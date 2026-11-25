@@ -575,3 +575,226 @@ expect(bob.sent.at(-1)).toEqual({ type: 'capture_list', capturers: [...] })
 - **頂層**：端對端，真瀏覽器真服務。最像真實使用，但慢、貴、容易因環境紅燈。AGENTS.md 說「尚無帶 session 的端點層級整合測試」就是這層目前是空的。
 
 💡 **能推到底層的邏輯盡量抽成純函式推下去，中層只留真正需要驗流程的部分。** 步驟 2 把排序去重抽成 `capturersFromMetas()` 就是在做這件事；剩下真的留在 DO 裡的，才需要問值不值得用中層測試蓋。
+
+## 2026-11-25：PR #154 合併、bestian 放行步驟 2、狀態契約逐條教學
+
+### 1. 進度：步驟 1 完結，步驟 2 可以動工
+
+- **PR #154 已合併。** Link1515 於 11/24 01:12 APPROVED、01:13 merge（merge commit `2096622`），CI 兩個 job（`check / test / build / lemma:gen`、`lemma:check`）皆綠。
+- **六封「Run failed: CI … No jobs were run」通知信不是程式錯。** 它們對應 11/19–11/20 推上 PR 的六個舊 commit。外部 fork 第一次貢獻，每次 push 的 CI 都要維護者按核准才會跑；那六個 run 一直停在「等核准」、job 數為 0。bestian 只核准了最新 commit `4d6ca5a` 的 run（11/24 00:06 跑、00:08 全綠）。01:13:10 合併 PR 時，GitHub 把其餘「還在等核准」的舊 run 一次標成 failure 收掉（六個 run 的 `updated_at` 全是 01:13:12），然後寄信。以後推 PR 前在本機跑完 `vp check`、`vp test`、`vp run build`，盡量一次推到位，可減少中間 commit 與這類信。
+- **bestian 於 11/23 22:11 回覆步驟 2 計畫（issuecomment-7115440143）：整體方向合理，可依方案 B 進行，從 `main` 開分支即可。** 三個問題的答案：方向 ✅、範圍沒有多做但漏了四組細節、測試 ✅ 可以直接建構 DO 加假 WebSocket。他另外補了一份「狀態契約」，下面逐條整理。
+
+### 2. 用比喻理解整件事
+
+把線上會議想成一間**會議室**。
+
+- **會議室本身 = Durable Object（DO）。** 一天一間，房間管理員負責記住誰在裡面、把訊息廣播給所有人。
+- **每個人進門時拿到的名牌貼紙 = attachment。** 上面寫「我是誰（userId）、我叫什麼（name）、我有沒有在錄音（capturing）」。
+- **門口櫃台 = Worker 的 `meeting.ts`。** 櫃台看身分證（session）幫你寫名牌，不准你自己寫，否則有人會冒充別人。
+- **舊做法：白板上只有一格「現在錄音的人：＿＿」**（D1 的 `recording_speaker`）。甲寫上名字，30 秒後乙也寫，甲就被擦掉。這是「名字每 30 秒互蓋」的根源。
+- **新做法：管理員看所有人的名牌，算出「正在錄音的名單」，廣播給大家。** 白板那一格先留著不擦，給還沒更新的舊客戶看。
+
+我的計畫是「把白板單格改成名牌制」，bestian 的回覆是「方向對，但名牌制有幾個細節會出錯，先補進計畫」。
+
+### 3. 對照表：我問的三個問題 vs bestian 的回答
+
+| 我問的 | bestian 的答案 | 白話 |
+| --- | --- | --- |
+| **方向**：名單放 DO 連線狀態、不加 migration、保留舊欄位做相容橋，夠簡潔嗎？ | **可以。** 名單是「各連線現在回報的狀態」，不用存進資料庫。以 userId 去重合理。 | 名牌制通過。同一人開兩個分頁，只要還有一個在錄，名單就要有他。 |
+| **範圍**：有沒有多做或漏做？ | **沒有多做，但漏了四組細節**（第 5 節）。 | 他沒砍項目，而是加了「這些情況計畫沒寫到，會出 bug」。 |
+| **測試**：可以直接建構 DO 加假 WebSocket 來測嗎？ | **可以，而且要這樣測。** 但要呼叫真的 DO 方法、檢查其他人收到什麼，不能只檢查「假物件有被叫到」。 | 他選了成本高但驗得多的那條路，還多列了六個測試案例。 |
+
+### 4. 對照表：計畫每一層改動，bestian 的態度
+
+| 層 | 我寫的 | 回應 | 加的條件 |
+| --- | --- | --- | --- |
+| Worker `meeting.ts` | 多轉送 `X-User-Name`，先編碼，名字從 session 填 | ✅ | **Worker 無條件覆寫這個標頭。** 外部請求自帶的同名標頭要整個蓋掉，不然能自己填名字冒充別人。 |
+| DO `meeting-room.ts` | 名牌加 `name`、`capturing`；新增 `capture_status`／`capture_list`；`init` 帶名單；斷線時重算 | ✅ | `capture_status` 只接受布林；身分只信名牌不信訊息；未登入不能送；**每次改名牌都要 `serializeAttachment()` 貼回去**。 |
+| DO 相容橋 | 舊客戶端送 `sync_recording` 時照舊寫白板，也更新那條連線的名牌 | ✅ | 舊訊息**只改送它的那個人**的名牌，不能拿白板那一格反推名單。新名單只看 `init`／`capture_list`。相容橋的限制與移除條件寫進 PR 說明。 |
+| 純函式 `capture-list.ts` | `capturersFromMetas()` 過濾、去重、排序 | ✅ | 無。 |
+| 前端 `JitsiView.vue` | 按下麥克風送 true、停止送 false、每 30 秒不重送；顯示改讀名單 | ⚠️ | true 要**錄音器真的啟動後**才送；false 要多涵蓋一條路徑；顯示條件拿掉 `!isTranscripting`。 |
+| i18n | 新增 `jitsi.capturingList`、移除 `jitsi.recordingStatus` | ✅ | 無。 |
+
+### 5. 對照表：bestian 補的四組「沒想到的情況」（狀態契約）
+
+| # | 情況 | 我原本寫的 | 會出什麼 bug | bestian 要求 |
+| --- | --- | --- | --- | --- |
+| 1 | 錄音什麼時候算開始 | 按下麥克風時送 true | `audioRecordingActive` 在**還沒拿到麥克風權限**時就變 true（`JitsiView.vue:1022`）。使用者拒絕權限，名單上卻顯示他在錄。 | 錄音器**成功啟動後**才送 true。 |
+| 1 | 錄音什麼時候算結束 | 手動停止或錄音錯誤時送 false | 還有第三條路：登入失效時 `authSession` watcher 直接呼叫 `cleanupAudioRecording()`（第 566 行），不會關 WebSocket。沒送 false，別人的名單上你永遠在錄。 | false 要涵蓋這條清理路徑；30 秒換段不能讓名單閃一下。 |
+| 2 | 名牌要貼回去 | 改 attachment 的 `capturing` | Cloudflare 給的名牌是**影本**，改影本原件不變。休眠醒來讀到舊原件。 | 每次改完都 `serializeAttachment()`。 |
+| 2 | 正在離開的人 | 斷線時排除正在斷的連線 | 叫了 `close()` 之後 `getWebSockets()` **還是可能列出那條連線**（CLOSING）。下次重算又把他算進去。 | 把名牌標成沒在錄並貼回去，或聚合時排除非 OPEN。不要另養一份名單快取。 |
+| 3 | 斷線後畫面怎麼顯示 | 重連時 onopen 重送 true | 沒寫「斷線期間畫面顯示什麼」。繼續顯示最後一份名單，使用者以為是即時的。 | 斷線或切歷史日期時**清空名單或標示「無法同步」**。名單空不代表沒人在錄。 |
+| 4 | 名單和音檔處理是兩件事 | 顯示改讀名單 | 現在顯示有 `!isTranscripting` 條件（第 225 行）：自己一轉錄，**整份名單消失**。 | 拿掉這個條件。佇列提示不再用單一 `recordingSpeaker`。名單、自己的倒數、待處理音檔數各自顯示。 |
+| 4 | 版面 | 不顯示秒數 | 原框 `w-48 h-6` 只放得下一個名字，多人或長名字爆版。 | 要能換行。連帶刪掉只服務共用秒數的 `recordingDuration` 與每秒計時器。 |
+
+### 6. 細講：「每 30 秒換段」是什麼、為什麼會讓名單閃
+
+**現在就有的功能，不是步驟 2 新加的。** `JitsiView.vue:395` 的 `maxRecordingTime: 30 * 1000`。按一次紫色麥克風，不是一路錄到按停止，而是**每 30 秒切一段、送去轉錄、馬上再開下一段**：
+
+| 步驟 | 行號 | 發生什麼 |
+| --- | --- | --- |
+| 1 | 1077 | `recorder.start()` 開始錄這一段 |
+| 2 | 1084 | 設 30 秒鬧鐘 `setTimeout(..., maxRecordingTime)` |
+| 3 | 1086 | 鬧鐘響，`stopAudioRecordingForNextRound()` 把錄音器 stop |
+| 4 | 1055 | 觸發 `recorder.onstop` |
+| 5 | 1063 | 這 30 秒音檔丟去轉錄 `processRecordedAudio` |
+| 6 | 1065 | `audioRecordingActive` 還是 true → `startNextRecordingRound()` |
+| 7 | 1490 | 再呼叫 `startAudioRecording()`，回到步驟 1 |
+
+為什麼要切段：音檔要送去轉錄才會變文字，等講完一小時再送就不是即時逐字稿。**每一輪都重跑 `startAudioRecording()`**，而它第 1078 行有 `syncRecordingStatus()`——這就是計畫裡「每輪 30 秒重開錄音時都會再 sync 一次」，名字互蓋的來源之一。
+
+**為什麼會閃：** 計畫已寫「每 30 秒的新一輪不重送」，但 bestian 的「true 要成功啟動後才送」會把送出點推進 `startAudioRecording()`，而它每輪都跑；最直覺對稱寫法「`recorder.start()` 後送 true、`onstop` 送 false」兩個點每 30 秒各跑一次：
+
+```
+0 秒     啟動 → 送 true  → 名單出現「你」
+30 秒    鬧鐘響、stop → 送 false → 「你」消失
+30.0x 秒 下一輪啟動 → 送 true  → 「你」又出現
+```
+
+**解法：分清兩種停止。**
+
+| 種類 | 觸發點 | 送 false？ |
+| --- | --- | --- |
+| 換段停止（使用者沒要停） | 1086 鬧鐘、1483 `stopAudioRecordingForNextRound` | **不送**，`audioRecordingActive` 仍 true |
+| 真的停止 | `stopAudioRecording()` 1106、`handleAudioRecordingError()` 1097、`cleanupAudioRecording()` 1177 | **送**，session 層級結束 |
+
+true 只在**第一輪**成功啟動後送一次：加旗標 `captureAnnounced`，第一輪 `recorder.start()` 成功後若旗標 false 就送 true 並設 true，之後每輪跳過；真的停止時送 false 並歸零。
+
+相容橋補充：舊 `sync_recording` 每輪都送（1078），DO 收到時把那條連線 capturing 設 true；每輪都是 true 所以不閃，只是每 30 秒多廣播一次。真正的 false 來自 `stopAudioRecording` 1110 送的 `recording_speaker: null`。這就是為什麼 bestian 說舊訊息「只更新送出者自己的連線」就夠。
+
+💡 **輪（round）**：一次 30 秒錄音。**session 層級 vs 輪層級**：session 是從按下到按停止整段，名單反映的是 session。**旗標（flag）**：記「某件事做過沒」的 true／false 變數。
+
+### 7. 細講：換行、刪 `recordingDuration` 與計時器
+
+現在的紅框（224–229 行）：`v-if="meetingData.recordingSpeaker && !isTranscripting"`、class `h-6 w-48 … rounded-full justify-center`。
+
+| class | 意思 | 放名單會壞在哪 |
+| --- | --- | --- |
+| `w-48` | 寬 192px 固定 | 多人名字塞不下 |
+| `h-6` | 高 24px 固定 | 只容一行，換了行第二行被切 |
+| `rounded-full` + `justify-center` | 膠囊置中 | 多行形狀怪 |
+
+改成最大寬度加自動高度（如 `max-w-64 h-auto px-3 py-1 whitespace-normal`）。
+
+「已錄 N 秒」來自 computed `recordingDuration`（460）：現在時間減 `recordingStartTime`，後者從 DO 廣播的 `recording_synced` 來，**所有人看到同一數字**，所以叫共用秒數。Vue computed 只在響應式依賴變動時重算，`Date.now()` 不是響應式，所以 mounted 第 490 行開了每秒鬧鐘改 `recordingTimer`，computed 裡 `void this.recordingTimer` 是「故意碰一下讓 Vue 以為我依賴它」。按鈕上的倒數是 `recordingTimeLeft`（1082），本機從 30 倒數，另一套東西。共用秒數不顯示後整條鏈沒人用，要刪六處：
+
+| 要刪 | 行號 |
+| --- | --- |
+| `recordingTimerInterval: null` | 415 |
+| `recordingTimer: 0` | 416 |
+| computed `recordingDuration` | 460–464 |
+| mounted `setInterval` | 489–492 |
+| unmount `clearInterval` | 529–532 |
+| `this.recordingTimer = 0` | 1111 |
+
+留著就是每秒醒一次卻什麼都不做的鬧鐘，白耗電、每秒重渲染。💡 **死程式碼**：沒人用但還在檔案裡，不報錯所以容易忽略。
+
+### 8. 細講：「名牌重新反序列化後仍是最新狀態」
+
+DO 現在只有兩處碰名牌：158 行 `server.serializeAttachment(meta)` 連線建立時貼一次；111 行 `ws.deserializeAttachment()` 每則訊息讀一次。名牌內容貼上後沒改過，所以現在沒事。步驟 2 要改 `capturing`，問題就來了。
+
+Cloudflare 的設計：`deserializeAttachment()` 給**影本**；改影本原件不變；要改原件必須 `serializeAttachment()` 整張換掉。
+
+```ts
+const meta = ws.deserializeAttachment()
+meta.capturing = true
+ws.serializeAttachment(meta)     // 少這行，廣播時讀到的還是舊原件
+this.broadcastCaptureList()
+```
+
+為什麼這樣設計：第 13 行註解說這個 DO 用 Hibernation API。房間沒動靜時 DO 睡著，記憶體清空，**只有名牌活下來**。
+
+**測試要防的是替身藏 bug**。最偷懶的 `FakeWebSocket`：`serializeAttachment(v){this.att=v}`、`deserializeAttachment(){return this.att}`——回傳**原件本人**，DO 忘了貼回去也直接改到原件，測試假綠。正確替身兩邊都複製：`structuredClone(v)`。然後測：送 `capture_status: true` 後**再次** `deserializeAttachment()`，斷言 `capturing` 為 true。
+
+| 替身寫法 | DO 忘了 serializeAttachment | 結果 |
+| --- | --- | --- |
+| 回傳同一物件 | 測試仍綠 | bug 被藏起來，上線才爆 |
+| 回傳複製品 | 測試紅燈 | 開發時抓到 |
+
+💡 **序列化／反序列化**：物件變成可存格式（拍照存檔）／讀回來變物件（沖洗出來，是新的一張）。**參照（reference）**：物件變數存的是地址，兩個變數指同一地址改一個另一個也變；`structuredClone` 做地址不同的完整複製。
+
+### 9. 對照表：12 條測試案例（小明、阿華、小美）
+
+| # | 情境 | 測試怎麼做 | 要看到什麼 | 沒測會漏的 bug | 層 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 小明按下麥克風 | 小明連線送 `capture_status: true` | 阿華收到含小明的 `capture_list` | DO 沒廣播或廣播錯人 | DO |
+| 2 | 小明開兩分頁都在錄 | 兩條連線同 userId、都 capturing | 名單「小明」只一次 | 顯示「小明、小明」 | 純函式 |
+| 3 | 小明關分頁 | 呼叫 `webSocketClose(小明)` | 阿華收到新名單，無小明 | 走了還掛著 | DO |
+| 4 | 未登入訪客送 `capture_status` | `isAuthenticated: false` 連線送訊息 | 收到 error，名單沒變 | 任何人能塞進名單 | DO |
+| 5 | 阿華用舊版只送 `sync_recording` | 假裝阿華送舊訊息 | 名單出現阿華 | 舊版使用者從名單消失 | DO |
+| 6 | 小明在錄，小美才進來 | 檢查推給小美的 `init` | `init` 名單含小明 | 小美要等 30 秒才看到 | DO |
+| 7 | 小明兩分頁都在錄，**關一個** | 對其中一條 `webSocketClose` | 名單**還有小明**；第二條也關才消失 | 關一個分頁就踢人 | DO |
+| 8 | DO 改了小明名牌 | 送 true 後**再次** `deserializeAttachment()` | `capturing` 為 true | 忘了貼回去；替身需回傳複製品 | DO |
+| 9a | 小明**拒絕麥克風權限** | 模擬 `getUserMedia` 失敗 | 沒送 true | 別人看到他在錄 | 前端 |
+| 9b | 小明錄到一半**被登出** | 觸發 watcher 走 `cleanupAudioRecording()` | 有送 false | 永遠掛著 | 前端 |
+| 9c | 小明正常錄，**30 秒換段** | 跑完一輪進第二輪 | 不再送 true、不送 false | 每 30 秒閃 | 前端 |
+| 10a | 小明新版、阿華舊版**訊息交錯** | 兩種訊息交錯幾次 | 兩人都在，誰都不踢誰 | 舊「誰最後送誰贏」滲進新名單 | DO |
+| 10b | 中途加入者 `init` 正確 | 同 6 加上 7、10a 混合 | `init` 與現場廣播一致 | `init` 另一套邏輯算出不同名單 | DO |
+| 11a | 名字是中文 | session 名字 `encodeURIComponent` 進標頭，DO 解碼 | 顯示「王小明」非 `%E7…` | 標頭不能放中文；沒解碼顯示亂碼 | Worker + DO |
+| 11b | 壞人自帶 `X-User-Name: bestian` | 外部請求自帶身分標頭 | DO 收到 session 真名，外部的被覆寫 | 冒充管理員 | Worker |
+| 12 | 真瀏覽器再做一次 | 兩瀏覽器不同帳號手動操作 | 名單一致；一邊停另一邊即時更新；轉錄中名單仍在；關一分頁不影響另一個 | 替身模仿不到的真實行為 | 人工 |
+
+分組記：基本動作 1、3、6；去重 2、7；安全 4、11b；相容橋 5、10a、10b；儲存正確 8；前端時機 9a–9c；編碼 11a；真實環境 12。
+
+💡 **假綠**：測試通過但程式有 bug，第 8 條專防。**狀態類 vs 事件類訊息**：「我在錄」是狀態只有最新算數；「存這條逐字稿」是事件每筆都要到。
+
+### 10. 細講：CLOSING 連線——離開的人會詐屍
+
+DO 現在的 `webSocketClose`（132）只回 `ws.close(code, reason)`。計畫要在這裡重算名單並廣播、排除正在斷的連線。但名單從 `this.ctx.getWebSockets()`（219）算，而官方文件說：**叫了 `close()` 之後，這條連線有一小段時間還會出現在 `getWebSockets()` 裡**，狀態 CLOSING。
+
+💡 **readyState**：0 CONNECTING、1 OPEN、2 CLOSING（站起來走向門口還沒跨出去）、3 CLOSED。
+
+| 時間 | 發生什麼 | 名單 | 對不對 |
+| --- | --- | --- | --- |
+| 0 秒 | 小明、阿華都在錄 | 小明、阿華 | ✅ |
+| 10 秒 | 小明關分頁，`webSocketClose` 用「排除這條 ws」算名單廣播 | 阿華 | ✅ |
+| 10.5 秒 | 小美送 `capture_status: true`，DO 重算。`getWebSockets()` 還回傳小明的 CLOSING 連線，名牌 capturing 仍 true | 小明、阿華、小美 | ❌ 詐屍 |
+| 12 秒 | Cloudflare 移除小明連線 | 阿華、小美 | ✅ |
+
+只在 `webSocketClose` 那一次排除了他，**下一次由別人觸發的重算不知道要排除誰**。
+
+| 解法 | 怎麼做 | 原理 |
+| --- | --- | --- |
+| 改名牌 | `webSocketClose` 一開始就把名牌設 `capturing: false` 並 `serializeAttachment()` | 之後誰觸發重算，讀到都是沒在錄；名牌隨連線被清掉不用善後 |
+| 聚合時過濾 | 只看 `ws.readyState === 1` | CLOSING 直接跳過 |
+
+兩個一起做最保險，`webSocketError` 比照。**不要另養記憶體 Set**：休眠清空記憶體；兩份真相會打架。💡 **單一真相來源**：一件事只存一個地方，其他都從它算。
+
+### 11. 細講：斷線時畫面怎麼顯示——別把舊照片當直播
+
+前端 `ws.onclose`（1380）只把 `this.ws` 設 null，**畫面資料一個字都不動**，也不重連。小明網路斷了，他畫面上「正在轉錄：阿華、小美」會**永遠停在斷線前那一刻**。💡 **快照 vs 即時**：照片 vs 直播；斷線後只剩照片但畫面沒說。
+
+| 狀況 | 畫面 | 為什麼 |
+| --- | --- | --- |
+| 連線正常有人錄 | 正在轉錄：阿華、小美 | 正常 |
+| 連線正常沒人錄 | 不顯示 | 正常 |
+| **連線斷了** | 清空或「無法同步」 | 舊名單不能假裝即時 |
+| **切歷史日期** | 清空 | 歷史走 REST，沒有即時名單 |
+
+**程式碼陷阱**：`disconnectWs()`（1390）關閉前**先把 `onclose` 拔掉**（`this.ws.onclose = null`），切歷史日期走的 `connectToMeeting()`（1349）就是呼叫它。寫在 `onclose` 的清空邏輯切日期時不會跑。
+
+| 斷線方式 | `onclose` 會跑？ | 清空該放哪 |
+| --- | --- | --- |
+| 網路自己斷 | 會 | `onclose` 可以 |
+| 切歷史日期／離開頁面 | **不會** | `disconnectWs()` |
+
+結論：放 `disconnectWs()` 一處，兩條路都經過。
+
+**「名單為空不代表沒人在錄」兩層意思：**
+
+- 別人：斷線後名單清空，阿華可能還在錄，只是收不到更新。用 `null` 表示「不知道」、`[]` 表示「確定沒人」：
+
+| 值 | 意思 | 畫面 |
+| --- | --- | --- |
+| `['阿華', '小美']` | 確定這些人在錄 | 顯示名單 |
+| `[]` | 確定沒人 | 不顯示 |
+| `null` | 斷線，不知道 | 「無法同步」 |
+
+- 自己：`audioRecordingActive` 與 WebSocket 是獨立變數，WS 斷了錄音器還在跑、30 秒換段還在、音檔還在排隊。**不能**看到名單空就停掉自己的錄音。
+
+**重連後的訊息順序**：`sendMeetingMessage`（903）在連線非 OPEN 時把訊息排進 `wsPendingMessages`，`onopen` 一口氣沖出。若 `onopen` 先送目前狀態再沖佇列，佇列尾端過期的 `false` 會蓋掉。安全做法：**先沖佇列、最後送目前狀態**；或更乾淨——沖出前把佇列裡的 `capture_status` 全丟掉只送目前狀態，因為狀態類訊息只有最後一筆有意義（事件類如 `save_entry` 不能丟）。
+
+### 12. 下一步
+
+1. 回答第 4 節的三個自測問題。
+2. `git fetch upstream`，從 `upstream/main` 開 `feat/153-capture-list`，依第 4、5 節的契約實作，測試照第 9 節 12 條。
